@@ -19,20 +19,21 @@ source /home/cam/agent-env/bin/activate
 # Default 120s/90s are too short for llama3.1:8b (~180-300s per response on CPU).
 # 600s = 10 min gives headroom for cold model loads and long generations.
 # To switch models, update llm_model in config.yaml and "model" in ~/.nanobot/config.json.
-export NANOBOT_OPENAI_COMPAT_TIMEOUT_S=600
-export NANOBOT_STREAM_IDLE_TIMEOUT_S=300
+export NANOBOT_OPENAI_COMPAT_TIMEOUT_S=1200
+export NANOBOT_STREAM_IDLE_TIMEOUT_S=600
 
 # Run nanobot agent.
 # Prompt keeps instruction concise to reduce tokens-to-process.
 # ntfy_mcp.py guards against file-reference strings reaching the notification.
 echo "[2/3] Running nanobot agent..." >> "$LOG"
 nanobot agent --logs --no-markdown -m "\
-Call get_todays_schedule (no args) then read_recent_notes (no args). \
-Write a concise daily briefing for Cam: list today's meetings (time and title), \
-then 3-5 bullet points of key themes or action items from the notes. \
-Under 400 words, no preamble. \
-Finally call send_briefing_to_cam with the briefing text as the message — \
-pass the actual text, not a file reference." \
+You must complete these steps in order without stopping early: \
+1. Call get_todays_schedule (no arguments). \
+2. Call read_recent_notes (no arguments). \
+3. Call send_briefing_to_cam with a single message argument containing: \
+   today's meetings (time and title) from step 1, followed by 3-5 bullet points \
+   of key themes or action items from step 2. Under 300 words, no preamble. \
+Do not respond with text. Your only output must be the three tool calls above." \
   >> "$LOG" 2>&1 || echo "[warn] nanobot exited non-zero (likely MCP cleanup teardown — check above for actual errors)" >> "$LOG"
 
 echo "[3/3] Done." >> "$LOG"
