@@ -2,17 +2,40 @@
 """Logseq MCP server — exposes read_recent_notes() tool."""
 
 import datetime
+import logging
 import re
+import sys
 from pathlib import Path
 
 import yaml
 from mcp.server.fastmcp import FastMCP
 
 CONFIG_PATH = Path("/home/cam/nanobot-brief/config.yaml")
+LOG_FILE = Path("/home/cam/daily-briefings/mcp-debug.log")
+
+
+def _setup_logger(name: str) -> logging.Logger:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    log = logging.getLogger(name)
+    log.setLevel(logging.DEBUG)
+    if not log.handlers:
+        fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+        fh = logging.FileHandler(LOG_FILE)
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(fmt)
+        log.addHandler(sh)
+    return log
+
+
+log = _setup_logger("logseq")
+
 
 def _load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
+
 
 def _journal_date(path: Path) -> datetime.date | None:
     """Parse YYYY_MM_DD from Logseq journal filename."""
@@ -22,6 +45,7 @@ def _journal_date(path: Path) -> datetime.date | None:
     return None
 
 
+log.info("logseq MCP server started")
 mcp = FastMCP("logseq")
 
 
@@ -33,11 +57,14 @@ def read_recent_notes() -> str:
     mtime reset. Pages are filtered by filesystem mtime. Output is capped at
     max_notes_chars to fit within the local LLM context window.
     """
+    log.info("read_recent_notes called")
     config = _load_config()
     logseq_dir = Path(config.get("logseq_dir", "/home/cam/logseq-graph"))
     journal_days = int(config.get("journal_lookback_days", 3))
     lookback_hours = int(config.get("notes_lookback_hours", 48))
     max_chars = int(config.get("max_notes_chars", 25000))
+    log.info("logseq_dir=%s journal_days=%d lookback_hours=%d max_chars=%d",
+             logseq_dir, journal_days, lookback_hours, max_chars)
 
     today = datetime.date.today()
     cutoff_date = today - datetime.timedelta(days=journal_days)
@@ -54,6 +81,7 @@ def read_recent_notes() -> str:
             if d is not None and d >= cutoff_date:
                 journal_files.append((d, md_file))
     journal_files.sort(key=lambda x: x[0], reverse=True)
+    log.info("found %d journal file(s) in last %d days", len(journal_files), journal_days)
 
     if journal_files:
         sections.append(f"=== Journal entries (last {journal_days} days) ===")
@@ -62,6 +90,7 @@ def read_recent_notes() -> str:
             try:
                 sections.append(path.read_text(encoding="utf-8"))
             except Exception as e:
+                log.error("could not read %s: %s", path.name, e)
                 sections.append(f"[Could not read: {e}]")
 
     # ── Pages (mtime based) ──
@@ -73,6 +102,7 @@ def read_recent_notes() -> str:
             if mtime >= cutoff_mtime:
                 page_files.append((mtime, md_file))
     page_files.sort(key=lambda x: x[0], reverse=True)
+    log.info("found %d page file(s) modified in last %dh", len(page_files), lookback_hours)
 
     if page_files:
         sections.append(f"\n=== Recently modified pages (last {lookback_hours}h) ===")
@@ -81,9 +111,11 @@ def read_recent_notes() -> str:
             try:
                 sections.append(path.read_text(encoding="utf-8"))
             except Exception as e:
+                log.error("could not read %s: %s", path.name, e)
                 sections.append(f"[Could not read: {e}]")
 
     if not sections:
+        log.info("no notes found in configured windows")
         return f"No notes found in the last {journal_days} days / {lookback_hours} hours."
 
     full_text = "\n".join(sections)
@@ -91,6 +123,9 @@ def read_recent_notes() -> str:
     if len(full_text) > max_chars:
         full_text = full_text[:max_chars]
         full_text += f"\n\n[... truncated at {max_chars} chars to fit LLM context ...]"
+        log.info("output truncated to %d chars", max_chars)
+    else:
+        log.info("returning %d chars of notes", len(full_text))
 
     return full_text
 

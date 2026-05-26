@@ -20,7 +20,7 @@ source /home/cam/agent-env/bin/activate
 # The || true swallows nanobot's non-zero exit from the MCP cleanup CancelledError,
 # which fires after the work is already done.
 echo "[2/3] Running nanobot agent..." >> "$LOG"
-nanobot agent --no-markdown -m "\
+nanobot agent --logs --no-markdown -m "\
 Step 1: Call get_todays_schedule with no arguments to get today's calendar. \
 Step 2: Call read_recent_notes with no arguments to get recent Logseq notes. \
 Step 3: Using only the results from steps 1 and 2, write a concise daily briefing for Cam. \
