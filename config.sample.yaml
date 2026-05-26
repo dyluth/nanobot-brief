@@ -30,4 +30,11 @@ max_notes_chars: 25000
 # Local LLM backend (Ollama OpenAI-compatible endpoint)
 llm_base_url: http://127.0.0.1:11434/v1
 llm_model: llama3.1:8b
-# Tip: llama3.2:3b is ~3× faster on CPU with acceptable quality for summaries
+# Model notes:
+#   llama3.1:8b  — general purpose, ~3 min/response on CPU-only hardware
+#   hermes3:8b   — Llama3.1 fine-tuned for tool calling; much more reliable agent behaviour
+#   llama3.2:3b  — ~3× faster on CPU, lighter quality
+#
+# Environment vars set in generate-briefing.sh for CPU inference:
+#   NANOBOT_OPENAI_COMPAT_TIMEOUT_S=600   (nanobot default: 120 — too short for CPU)
+#   NANOBOT_STREAM_IDLE_TIMEOUT_S=300     (nanobot default: 90)
