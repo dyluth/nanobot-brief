@@ -1,0 +1,33 @@
+# Daily Briefing Agent Configuration — SAMPLE FILE
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this to config.yaml and fill in real values.
+# config.yaml is gitignored — NEVER commit it (contains private tokens).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Calendar ICS feeds — add or remove entries freely; the agent reads all of them.
+# Get the private ICS URL from Google Calendar:
+#   Settings → [Calendar name] → "Secret address in iCal format"
+calendar_feeds:
+  - https://calendar.google.com/calendar/ical/YOUR_EMAIL%40gmail.com/private-SECRETKEY/basic.ics
+  - https://calendar.google.com/calendar/ical/work%40yourcompany.com/private-SECRETKEY/basic.ics
+
+# ntfy.sh notification topic (the path component of your ntfy.sh URL)
+# e.g. if your URL is https://ntfy.sh/my-daily-brief-abc123, set:
+ntfy_topic: my-daily-brief-REPLACE_ME
+
+# Logseq graph root directory (should be a git-cloned Logseq repo)
+logseq_dir: /home/YOUR_USER/logseq-graph
+
+# Journal entries: number of past days to include (uses filename date)
+journal_lookback_days: 3
+
+# Pages: how far back to scan by filesystem mtime (hours)
+notes_lookback_hours: 48
+
+# Maximum characters to return from notes (prevents overwhelming local LLM context)
+max_notes_chars: 25000
+
+# Local LLM backend (Ollama OpenAI-compatible endpoint)
+llm_base_url: http://127.0.0.1:11434/v1
+llm_model: llama3.1:8b
+# Tip: llama3.2:3b is ~3× faster on CPU with acceptable quality for summaries

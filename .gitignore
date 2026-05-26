@@ -1,0 +1,12 @@
+# Real config contains private ICS tokens and ntfy topic — never commit this
+config.yaml
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# Logs
+*.log

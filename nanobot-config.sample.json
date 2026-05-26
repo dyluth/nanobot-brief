@@ -1,0 +1,34 @@
+{
+  "_comment": "This is the sample for ~/.nanobot/config.json — the nanobot framework config.",
+  "_comment2": "Copy to ~/.nanobot/config.json and replace /home/YOUR_USER with your actual home path.",
+  "providers": {
+    "ollama": {
+      "apiKey": "sk-local",
+      "apiBase": "http://127.0.0.1:11434/v1"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "ollama",
+      "model": "llama3.1:8b",
+      "maxTokens": 8192,
+      "temperature": 0.1
+    }
+  },
+  "tools": {
+    "mcpServers": {
+      "calendar": {
+        "command": "/home/YOUR_USER/agent-env/bin/python3",
+        "args": ["/home/YOUR_USER/nanobot-brief/mcp-servers/calendar/calendar_mcp.py"]
+      },
+      "logseq": {
+        "command": "/home/YOUR_USER/agent-env/bin/python3",
+        "args": ["/home/YOUR_USER/nanobot-brief/mcp-servers/logseq/logseq_mcp.py"]
+      },
+      "notify": {
+        "command": "/home/YOUR_USER/agent-env/bin/python3",
+        "args": ["/home/YOUR_USER/nanobot-brief/mcp-servers/notify/ntfy_mcp.py"]
+      }
+    }
+  }
+}
