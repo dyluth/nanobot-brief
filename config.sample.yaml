@@ -27,6 +27,16 @@ notes_lookback_hours: 48
 # Maximum characters to return from notes (prevents overwhelming local LLM context)
 max_notes_chars: 25000
 
+# Gmail IMAP accounts (read-only, via App Passwords — NOT your Gmail login password)
+# Enable 2-Step Verification, then generate an App Password at:
+#   https://myaccount.google.com/apppasswords  →  Select app: Mail, Select device: Other
+# Add one entry per account; remove entries you don't need.
+email_accounts:
+  - email: "you@gmail.com"
+    app_password: "xxxx xxxx xxxx xxxx"
+  # - email: "work@yourcompany.com"
+  #   app_password: "xxxx xxxx xxxx xxxx"
+
 # Local LLM backend (Ollama OpenAI-compatible endpoint)
 llm_base_url: http://127.0.0.1:11434/v1
 llm_model: llama3.1:8b

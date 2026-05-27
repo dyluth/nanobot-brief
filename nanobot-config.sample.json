@@ -28,6 +28,10 @@
       "notify": {
         "command": "/home/YOUR_USER/agent-env/bin/python3",
         "args": ["/home/YOUR_USER/nanobot-brief/mcp-servers/notify/ntfy_mcp.py"]
+      },
+      "email": {
+        "command": "/home/YOUR_USER/agent-env/bin/python3",
+        "args": ["/home/YOUR_USER/mcp-servers/email/email_mcp.py"]
       }
     }
   }

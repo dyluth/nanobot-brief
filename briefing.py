@@ -24,6 +24,7 @@ _CONFIG = _BASE / "config.yaml"
 # MCP server module paths
 sys.path.insert(0, str(_BASE / "mcp-servers" / "calendar"))
 sys.path.insert(0, str(_BASE / "mcp-servers" / "logseq"))
+sys.path.insert(0, str(_BASE / "mcp-servers" / "email"))
 
 
 def load_config():
@@ -50,7 +51,28 @@ def fetch_notes(max_chars: int = 3000):
     return notes
 
 
-def summarise(calendar: str, notes: str, config: dict) -> str:
+def fetch_emails() -> str:
+    """
+    Fetch recent emails via email_mcp.
+    Returns the formatted index+bodies string only when real emails were found.
+    Returns empty string on error, no accounts configured, or no recent mail
+    (so the LLM never sees a 'no emails' placeholder that confuses it).
+    """
+    try:
+        from email_mcp import get_recent_emails
+        result = get_recent_emails()
+        # Only pass structured content to the LLM; descriptive 'no X' messages
+        # are informative for humans/agents but pollute the summarisation prompt.
+        if "=== Email Index" not in result:
+            print(f"  ({result.strip()})", flush=True)
+            return ""
+        return result
+    except Exception as e:
+        print(f"  Warning: email fetch failed: {e}", flush=True)
+        return ""
+
+
+def summarise(calendar: str, notes: str, emails: str, config: dict) -> str:
     """Call Ollama to produce a concise plain-text briefing."""
     model = config.get("llm_model", "hermes3")
     ollama_base = config.get("ollama_base", "http://127.0.0.1:11434")
@@ -63,19 +85,19 @@ def summarise(calendar: str, notes: str, config: dict) -> str:
         "- No section headings, no labels, no headers of any kind\n"
         "- No markdown, no bullet symbols, no preamble, no sign-off\n"
         "- Under 200 words total\n"
-        "Output = two blocks separated by one blank line:\n"
+        "Output = up to three blocks separated by one blank line each:\n"
         "  block 1: one event per line, format:  HH:MM–HH:MM  Description\n"
-        "  block 2: 2-3 sentences of relevant context from the notes (omit block 2 if nothing is relevant)"
+        "  block 2: 2-3 sentences of relevant context from the notes (omit if nothing relevant)\n"
+        "  block 3: 1-2 sentences on any messages needing attention (omit if none or unimportant)"
     )
 
     # No English labels on the data sections — the model echoes them.
     # A --- separator is neutral enough not to trigger echo behaviour.
-    user_msg = (
-        f"{calendar}\n\n"
-        f"---\n\n"
-        f"{notes}\n\n"
-        "Write the briefing."
-    )
+    data_parts = [calendar, "---", notes]
+    if emails:
+        data_parts += ["---", emails]
+    data_parts.append("Write the briefing.")
+    user_msg = "\n\n".join(data_parts)
 
     payload = {
         "model": model,
@@ -105,19 +127,27 @@ def summarise(calendar: str, notes: str, config: dict) -> str:
     return _clean_briefing(content.strip())
 
 
-# Words hermes3 tends to echo back as section headers.
-_HEADER_WORDS = {
-    "calendar", "notes", "events", "schedule", "schedule:", "context",
+# Words/phrases hermes3 tends to echo back from the prompt.
+# Single-word section labels and multi-word instruction tails are both covered.
+_ECHO_LINES = {
+    # section labels
+    "calendar", "notes", "events", "schedule", "context",
     "today's events", "today's schedule", "recent notes", "today's calendar",
+    "email", "emails", "inbox", "messages",
+    # instruction tails the model sometimes echoes verbatim
+    "write the briefing",
+    "write briefing",
+    "write the daily briefing",
 }
 
 def _clean_briefing(text: str) -> str:
-    """Strip bare section-header lines that the model echoes from the prompt."""
+    """Strip bare echo lines that the model repeats from the prompt."""
     cleaned = []
     for line in text.splitlines():
-        normalised = line.strip().rstrip(":").lower()
-        if normalised in _HEADER_WORDS:
-            continue  # drop lines that are just an echoed label
+        # Normalise: strip surrounding whitespace, trailing punctuation, lowercase
+        normalised = line.strip().rstrip(":.!").lower()
+        if normalised in _ECHO_LINES:
+            continue  # drop echoed label or instruction
         cleaned.append(line)
     # Drop leading blank lines
     while cleaned and not cleaned[0].strip():
@@ -158,8 +188,12 @@ def main():
     notes = fetch_notes(max_chars=3000)
     print(f"  {len(notes)} chars")
 
+    print("Fetching emails...", flush=True)
+    emails = fetch_emails()
+    print(f"  {len(emails)} chars")
+
     print("Summarising with LLM...", flush=True)
-    briefing = summarise(calendar, notes, config)
+    briefing = summarise(calendar, notes, emails, config)
     print(f"  {len(briefing)} chars, {len(briefing.split())} words")
 
     print()
