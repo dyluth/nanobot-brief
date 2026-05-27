@@ -166,7 +166,7 @@ def send_notification(text: str, config: dict) -> None:
         data=text.encode("utf-8"),
         headers={
             "Title": "Daily Briefing",
-            "Priority": "default",
+            "Priority": "high",
             "Tags": "spiral_calendar",
         },
         method="POST",

@@ -68,7 +68,7 @@ def send_briefing_to_cam(message: str) -> str:
             data=message.encode("utf-8"),
             headers={
                 "Title": "Daily Briefing",
-                "Priority": "default",
+                "Priority": "high",
                 "Tags": "spiral_calendar",
             },
             timeout=15,
