@@ -27,6 +27,11 @@ notes_lookback_hours: 48
 # Maximum characters to return from notes (prevents overwhelming local LLM context)
 max_notes_chars: 25000
 
+# Your local timezone — used to display calendar times correctly when the server
+# runs on UTC (common for Linux VMs/headless boxes).
+# IANA tz name: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+timezone: Europe/London
+
 # Gmail IMAP accounts (read-only, via App Passwords — NOT your Gmail login password)
 # Enable 2-Step Verification, then generate an App Password at:
 #   https://myaccount.google.com/apppasswords  →  Select app: Mail, Select device: Other

@@ -13,6 +13,7 @@ With --dry-run, prints the briefing to stdout without sending.
 
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.error
@@ -51,6 +52,85 @@ def fetch_notes(max_chars: int = 3000):
     return notes
 
 
+def _strip_logseq_markdown(text: str) -> str:
+    """
+    Remove Logseq-specific markdown syntax so the LLM receives clean plain text
+    and doesn't parrot formatting artefacts into the briefing output.
+
+    Strips:
+    - Structural metadata lines (Generated:, Last N Days:, Journal:, Activity:, ---)
+    - Markdown headings (#/##/###) — markers stripped, text kept
+    - **[STATUS]** prefixes (TODO/NOW/DOING/LATER/DONE)
+    - **bold** markers (inner text kept)
+    - [[wiki links]] (display text kept)
+    - `backtick references` (journal/page source refs)
+    - ⏱ time-tracking markers
+    - Logseq priority tags (#A, #B, #C)
+    """
+    # Lines to drop after inline markdown has been stripped (startswith checks)
+    _SKIP = (
+        "Generated:", "Last ", "Journal:", "Activity:", "Tasks (",
+        "Time Logged:", "Time Tracking:",
+        "Recent Activity Timeline", "Knowledge Dashboard",
+        "---", "*Pages with",
+        # Dashboard sections we don't want
+        "📊", "📅", "🔗", "📝",
+    )
+    # Activity-count summary lines: "- 1 DONE task", "2 NOW tasks", etc.
+    _ACTIVITY_COUNT = re.compile(
+        r"^-?\s*\d+\s+(NOW|TODO|DONE|DOING|LATER)\s+tasks?\b", re.IGNORECASE
+    )
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # ── Strip inline markdown FIRST ──────────────────────────────────────
+        # Heading markers (keep text)
+        s = re.sub(r"^#{1,3}\s+", "", s)
+        # Status prefixes  **[TODO]** / **[NOW]** etc.
+        s = re.sub(r"\*\*\[(TODO|NOW|DOING|LATER|DONE)\]\*\*\s*[-–]?\s*", "", s)
+        # Bold markers (keep inner text)
+        s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+        # Wiki links → display text
+        s = re.sub(r"\[\[([^\]]+)\]\]", r"\1", s)
+        # Backtick content (source file references)
+        s = re.sub(r"`[^`]+`", "", s)
+        # Time-tracking markers
+        s = re.sub(r"⏱\s*[\dhms ]+", "", s)
+        # Priority tags (#A, #B, #C)
+        s = re.sub(r"(?<!\w)#[ABC](?!\w)\s*", "", s)
+        # Normalise whitespace
+        s = " ".join(s.split())
+        # ── Then decide whether to keep the cleaned line ──────────────────────
+        if not s:
+            continue
+        if any(s.startswith(p) for p in _SKIP):
+            continue
+        if _ACTIVITY_COUNT.match(s):
+            continue
+        lines.append(s)
+    return "\n".join(lines)
+
+
+def _extract_top_projects(dashboard_text: str) -> str:
+    """Extract only the Top Projects section from dashboard.md."""
+    lines = dashboard_text.splitlines()
+    in_projects = False
+    result = ["Top active projects:"]
+    for line in lines:
+        if "Top Projects" in line:
+            in_projects = True
+            continue
+        if in_projects:
+            if line.startswith("## "):
+                break  # next section — stop
+            s = line.strip()
+            if s and not s.startswith("*"):  # skip italicised footnotes
+                result.append(_strip_logseq_markdown(s))
+    return "\n".join(result) if len(result) > 1 else ""
+
+
 def _extract_active_tasks(status_text: str) -> str:
     """
     Extract the most actionable tasks from tasks-by-status.md content.
@@ -87,17 +167,21 @@ def _extract_active_tasks(status_text: str) -> str:
 
     parts = []
     if doing:
-        parts.append("### In Progress\n" + "\n".join(doing))
+        parts.append("In Progress: " + "; ".join(doing))
     if active:
-        parts.append("### Active Tasks\n" + "\n".join(active))
-    return "\n\n".join(parts)
+        parts.append("Active tasks: " + "; ".join(active))
+    return "\n".join(parts)
 
 
 def fetch_tasks(config: dict, max_chars: int = 1500) -> str:
     """
     Read task indexes from logseq_dir/.claude/indexes/.
-    Returns timeline-recent.md (last 7 days) plus a filtered extract of
-    active NOW/DOING/TODO tasks, capped at max_chars for LLM context budget.
+    Combines:
+    - timeline-recent.md  (last 7 days of journal activity)
+    - dashboard.md        (top active projects)
+    - tasks-by-status.md  (filtered to recent/priority active tasks)
+    All Logseq markdown is stripped before the text is returned, so the LLM
+    sees clean plain text rather than raw **bold** / [[wiki]] syntax.
     Returns empty string if the indexes directory doesn't exist.
     """
     logseq_dir = Path(config.get("logseq_dir", Path.home() / "logseq-graph"))
@@ -107,20 +191,29 @@ def fetch_tasks(config: dict, max_chars: int = 1500) -> str:
 
     parts: list[str] = []
 
+    # Recent journal activity (last 7 days)
     timeline = indexes_dir / "timeline-recent.md"
     if timeline.exists():
-        parts.append(timeline.read_text(encoding="utf-8").strip())
+        parts.append(_strip_logseq_markdown(timeline.read_text(encoding="utf-8")))
 
+    # Top active projects from dashboard (concise — just the projects section)
+    dashboard = indexes_dir / "dashboard.md"
+    if dashboard.exists():
+        proj = _extract_top_projects(dashboard.read_text(encoding="utf-8"))
+        if proj:
+            parts.append(proj)
+
+    # Active tasks: DOING + recent NOW/TODO
     status_file = indexes_dir / "tasks-by-status.md"
     if status_file.exists():
         extracted = _extract_active_tasks(status_file.read_text(encoding="utf-8"))
         if extracted:
-            parts.append(extracted)
+            parts.append(_strip_logseq_markdown(extracted))
 
     if not parts:
         return ""
 
-    result = "\n\n---\n\n".join(parts)
+    result = "\n\n".join(p for p in parts if p.strip())
     if len(result) > max_chars:
         result = result[:max_chars] + "\n... [task list truncated]"
     return result
@@ -222,14 +315,29 @@ _ECHO_LINES = {
     "write the daily briefing",
 }
 
+# Regex patterns for "nothing relevant here" sentences the model produces
+# instead of simply omitting the block as instructed.
+_NOTHING_HERE = re.compile(
+    r"^no (email|emails?|message|messages?|comm|comms?|task|tasks?)"
+    r"(\s+\w+){0,5}[.!]?$",
+    re.IGNORECASE,
+)
+
 def _clean_briefing(text: str) -> str:
-    """Strip bare echo lines that the model repeats from the prompt."""
+    """Strip bare echo lines and 'nothing here' sentences the model produces."""
     cleaned = []
     for line in text.splitlines():
-        # Normalise: strip surrounding whitespace, trailing punctuation, lowercase
-        normalised = line.strip().rstrip(":.!").lower()
+        stripped = line.strip()
+        # Drop horizontal rules the model copies from prompt separators
+        if stripped == "---":
+            continue
+        # Normalise: strip trailing punctuation, lowercase for set lookup
+        normalised = stripped.rstrip(":.!").lower()
         if normalised in _ECHO_LINES:
-            continue  # drop echoed label or instruction
+            continue
+        # Drop "No emails need a reply." style filler sentences
+        if _NOTHING_HERE.match(stripped):
+            continue
         cleaned.append(line)
     # Drop leading blank lines
     while cleaned and not cleaned[0].strip():

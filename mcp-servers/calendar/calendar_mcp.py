@@ -41,6 +41,19 @@ def _load_config() -> dict:
 
 
 def _local_tz() -> ZoneInfo:
+    """
+    Return the display timezone for calendar events.
+    Prefers the 'timezone' key in config.yaml so the briefing shows correct local
+    time even when the server's system clock is set to UTC (common on Linux VMs).
+    Falls back to tzlocal, then UTC.
+    """
+    try:
+        cfg = _load_config()
+        tz_name = cfg.get("timezone", "").strip()
+        if tz_name:
+            return ZoneInfo(tz_name)
+    except Exception:
+        pass
     try:
         import tzlocal
         return ZoneInfo(str(tzlocal.get_localzone()))
