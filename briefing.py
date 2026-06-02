@@ -11,6 +11,7 @@ Usage:
 With --dry-run, prints the briefing to stdout without sending.
 """
 
+import datetime
 import json
 import os
 import re
@@ -46,7 +47,7 @@ def fetch_calendar():
 
 def fetch_notes(max_chars: int = 3000):
     from logseq_mcp import read_recent_notes
-    notes = read_recent_notes()
+    notes = _strip_logseq_markdown(read_recent_notes())
     if len(notes) > max_chars:
         notes = notes[:max_chars] + "\n...(truncated)"
     return notes
@@ -57,26 +58,27 @@ def _strip_logseq_markdown(text: str) -> str:
     Remove Logseq-specific markdown syntax so the LLM receives clean plain text
     and doesn't parrot formatting artefacts into the briefing output.
 
-    Strips:
-    - Structural metadata lines (Generated:, Last N Days:, Journal:, Activity:, ---)
-    - Markdown headings (#/##/###) — markers stripped, text kept
-    - **[STATUS]** prefixes (TODO/NOW/DOING/LATER/DONE)
-    - **bold** markers (inner text kept)
-    - [[wiki links]] (display text kept)
-    - `backtick references` (journal/page source refs)
-    - ⏱ time-tracking markers
-    - Logseq priority tags (#A, #B, #C)
+    Drops entirely:
+    - DONE task lines (both **[DONE]** index format and "- DONE" journal format)
+    - === section headers produced by logseq_mcp (=== Journal entries ===, etc.)
+    - Journal date-header lines containing YYYY_MM_DD.md filename references
+    - Bare bullet points with no content
+    - Structural metadata lines (Generated:, Activity:, etc.)
+    - Activity-count summary lines ("- 1 DONE task", etc.)
+
+    Strips markers from (keeps text):
+    - Markdown headings (#/##/###)
+    - Active task status prefixes (**[TODO]** / **[NOW]** / **[DOING]** / **[LATER]**)
+    - **bold** markers, [[wiki links]], `backtick refs`, ⏱ time markers, #A/#B/#C tags
     """
-    # Lines to drop after inline markdown has been stripped (startswith checks)
+    # Lines to drop (startswith checks applied after inline stripping)
     _SKIP = (
         "Generated:", "Last ", "Journal:", "Activity:", "Tasks (",
         "Time Logged:", "Time Tracking:",
         "Recent Activity Timeline", "Knowledge Dashboard",
         "---", "*Pages with",
-        # Dashboard sections we don't want
         "📊", "📅", "🔗", "📝",
     )
-    # Activity-count summary lines: "- 1 DONE task", "2 NOW tasks", etc.
     _ACTIVITY_COUNT = re.compile(
         r"^-?\s*\d+\s+(NOW|TODO|DONE|DOING|LATER)\s+tasks?\b", re.IGNORECASE
     )
@@ -85,25 +87,36 @@ def _strip_logseq_markdown(text: str) -> str:
         s = line.strip()
         if not s:
             continue
-        # ── Strip inline markdown FIRST ──────────────────────────────────────
-        # Heading markers (keep text)
+
+        # ── Drop completed task lines before any stripping ────────────────────
+        # Index file format:   - **[DONE]** task text
+        if re.search(r"\*\*\[DONE\]\*\*", s):
+            continue
+        # Journal file format: - DONE task text
+        if re.match(r"^\s*-\s+DONE\b", s, re.IGNORECASE):
+            continue
+
+        # ── Drop === section headers (logseq_mcp output structure) ───────────
+        if re.match(r"^===.*===$", s):
+            continue
+
+        # ── Drop journal date-header lines  e.g. "Thursday, May 28 (2026_05_28.md)" ──
+        if re.search(r"\d{4}_\d{2}_\d{2}\.md", s):
+            continue
+
+        # ── Strip inline markdown ─────────────────────────────────────────────
         s = re.sub(r"^#{1,3}\s+", "", s)
-        # Status prefixes  **[TODO]** / **[NOW]** etc.
-        s = re.sub(r"\*\*\[(TODO|NOW|DOING|LATER|DONE)\]\*\*\s*[-–]?\s*", "", s)
-        # Bold markers (keep inner text)
+        # Active task status prefixes only (DONE already dropped above)
+        s = re.sub(r"\*\*\[(TODO|NOW|DOING|LATER)\]\*\*\s*[-–]?\s*", "", s)
         s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
-        # Wiki links → display text
         s = re.sub(r"\[\[([^\]]+)\]\]", r"\1", s)
-        # Backtick content (source file references)
         s = re.sub(r"`[^`]+`", "", s)
-        # Time-tracking markers
         s = re.sub(r"⏱\s*[\dhms ]+", "", s)
-        # Priority tags (#A, #B, #C)
         s = re.sub(r"(?<!\w)#[ABC](?!\w)\s*", "", s)
-        # Normalise whitespace
         s = " ".join(s.split())
-        # ── Then decide whether to keep the cleaned line ──────────────────────
-        if not s:
+
+        # ── Drop lines that are now empty or bare bullets ─────────────────────
+        if not s or s in ("-", "–", "—"):
             continue
         if any(s.startswith(p) for p in _SKIP):
             continue
@@ -113,8 +126,40 @@ def _strip_logseq_markdown(text: str) -> str:
     return "\n".join(lines)
 
 
+# Matches [[Jun 3rd, 2026]], [[Jun 3, 2026]], [[November 24th, 2025]], etc.
+_FUTURE_DATE_RE = re.compile(
+    r"\[\[(?P<mon>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?"
+    r"|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    r"\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?P<year>\d{4})\]\]",
+    re.IGNORECASE,
+)
+_NEXT_WEEK_RE = re.compile(
+    r"\bnext\s+(?:week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+_MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _is_future_task(task_line: str, today: datetime.date) -> bool:
+    """Return True if the task is explicitly dated more than 2 days from today."""
+    if _NEXT_WEEK_RE.search(task_line):
+        return True
+    for m in _FUTURE_DATE_RE.finditer(task_line):
+        try:
+            month = _MONTH_MAP[m.group("mon")[:3].lower()]
+            task_date = datetime.date(int(m.group("year")), month, int(m.group("day")))
+            if (task_date - today).days > 2:
+                return True
+        except (ValueError, KeyError):
+            pass
+    return False
+
+
 def _extract_top_projects(dashboard_text: str) -> str:
-    """Extract only the Top Projects section from dashboard.md."""
+    """Extract only projects with active tasks from the Top Projects section."""
     lines = dashboard_text.splitlines()
     in_projects = False
     result = ["Top active projects:"]
@@ -126,7 +171,8 @@ def _extract_top_projects(dashboard_text: str) -> str:
             if line.startswith("## "):
                 break  # next section — stop
             s = line.strip()
-            if s and not s.startswith("*"):  # skip italicised footnotes
+            # Only include projects that have at least one active task
+            if s and not s.startswith("*") and "active task" in s.lower():
                 result.append(_strip_logseq_markdown(s))
     return "\n".join(result) if len(result) > 1 else ""
 
@@ -136,8 +182,10 @@ def _extract_active_tasks(status_text: str) -> str:
     Extract the most actionable tasks from tasks-by-status.md content.
     Keeps: all DOING tasks; NOW/TODO tasks from 2026 journals; #A/#B
     priority tasks from project pages.
-    Drops: Logseq query artefacts ('LATER DOING)'), stale 2025 entries.
+    Drops: Logseq query artefacts ('LATER DOING)'), stale 2025 entries,
+    and tasks explicitly dated more than 2 days in the future.
     """
+    today = datetime.date.today()
     lines = status_text.splitlines()
     doing, active = [], []
     current = None
@@ -155,6 +203,9 @@ def _extract_active_tasks(status_text: str) -> str:
 
         is_artifact = "LATER DOING)" in line or "DOING)" in line
         if is_artifact:
+            continue
+
+        if _is_future_task(line, today):
             continue
 
         if current == "DOING":
@@ -191,10 +242,16 @@ def fetch_tasks(config: dict, max_chars: int = 1500) -> str:
 
     parts: list[str] = []
 
-    # Recent journal activity (last 7 days)
+    # Recent journal activity (last 7 days) — filter future-dated lines before strip removes [[date]] markers
     timeline = indexes_dir / "timeline-recent.md"
     if timeline.exists():
-        parts.append(_strip_logseq_markdown(timeline.read_text(encoding="utf-8")))
+        raw = timeline.read_text(encoding="utf-8")
+        today = datetime.date.today()
+        filtered = "\n".join(
+            line for line in raw.splitlines()
+            if not _is_future_task(line, today)
+        )
+        parts.append(_strip_logseq_markdown(filtered))
 
     # Top active projects from dashboard (concise — just the projects section)
     dashboard = indexes_dir / "dashboard.md"
@@ -219,29 +276,224 @@ def fetch_tasks(config: dict, max_chars: int = 1500) -> str:
     return result
 
 
-def fetch_emails() -> str:
+def _header_check_llm_call(meta: dict, config: dict) -> bool:
     """
-    Fetch recent emails via email_mcp.
-    Returns the formatted index+bodies string only when real emails were found.
-    Returns empty string on error, no accounts configured, or no recent mail
-    (so the LLM never sees a 'no emails' placeholder that confuses it).
+    Ask the LLM whether a single email header is worth reading in full.
+    Returns True if the email looks like it needs Cam's personal attention.
+    Returns False on error (safe default — skip rather than waste a body fetch).
+    """
+    model = config.get("llm_model", "hermes3")
+    ollama_base = config.get("ollama_base", "http://127.0.0.1:11434")
+    url = f"{ollama_base}/v1/chat/completions"
+
+    system_msg = (
+        "Reply with exactly one word: yes or no. "
+        "Reply 'yes' if this email: (a) is from a real person needing a reply or decision; "
+        "(b) is a security or account alert (e.g. from Google, Apple, a bank, or payment provider); "
+        "or (c) is a practical local reminder (e.g. bin/refuse collection, appointment, delivery). "
+        "Reply 'no' for: newsletters, marketing, promotions, mailing lists, social media "
+        "notifications, charity solicitations, and automated system emails that don't require action."
+    )
+    user_msg = f"From: {meta['from_addr']}\nSubject: {meta['subject']}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "stream": False,
+        "temperature": 0.0,
+        "max_tokens": 5,
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-local",
+        },
+    )
+
+    timeout = config.get("llm_timeout_s", 1200)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        response = data["choices"][0]["message"]["content"].strip().lower()
+        return "yes" in response
+    except Exception as e:
+        print(f"  Warning: header check LLM call failed: {e}", flush=True)
+        return False
+
+
+def _evaluate_email_llm_call(meta: dict, body: str, config: dict) -> str:
+    """
+    Ask the LLM to summarise what action/info is needed from a single email.
+    Returns a one-sentence summary, or 'nothing' if the email is not actionable.
+    Returns 'nothing' on error (caller treats it as discard).
+    """
+    model = config.get("llm_model", "hermes3")
+    ollama_base = config.get("ollama_base", "http://127.0.0.1:11434")
+    url = f"{ollama_base}/v1/chat/completions"
+
+    system_msg = (
+        "Summarise this email in ONE sentence describing what personal action Cam needs "
+        "to take or what genuinely important information it contains. "
+        "Only keep the email if a real person is expecting a reply from Cam, or Cam has "
+        "a specific task or deadline arising from it. "
+        "If this is a promotional, marketing, automated, or mailing-list email — "
+        "or if no personal response or action is required — reply exactly: nothing"
+    )
+    user_msg = f"From: {meta['from_addr']}\nSubject: {meta['subject']}\n\n{body}"
+    # Truncate very long bodies — the evaluator doesn't need more than ~4 KB
+    if len(user_msg) > 4000:
+        user_msg = user_msg[:4000] + "\n... [truncated]"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "stream": False,
+        "temperature": 0.2,
+        "max_tokens": 100,
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer sk-local",
+        },
+    )
+
+    timeout = config.get("llm_timeout_s", 1200)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"  Warning: evaluator LLM call failed for '{meta['subject'][:40]}': {e}", flush=True)
+        return "nothing"
+
+
+_EMAIL_MAX_TO_CHECK = 100  # examine at most this many headers per run
+_EMAIL_MAX_TO_KEEP  = 5   # stop after collecting this many actionable summaries
+
+# Keyword bypass: these pass straight through without calling the LLM header check.
+# Security alerts: known sender domains paired with security-related subject keywords.
+# Practical reminders: subject-line is itself the actionable info; no body needed.
+_SECURITY_SENDER_RE = re.compile(
+    r"accounts\.google\.com|accounts\.apple\.com|account\.live\.com|account\.microsoft\.com",
+    re.IGNORECASE,
+)
+_SECURITY_SUBJECT_RE = re.compile(
+    r"security\s+alert|sign.?in\s+(attempt|detected)|account\s+(access|breach|compromis)",
+    re.IGNORECASE,
+)
+_REMINDER_SUBJECT_RE = re.compile(
+    r"\b(refuse\s+collection|bin\s+collection|collection\s+remind)\b",
+    re.IGNORECASE,
+)
+# Personal-name sender: single initial + dot + surname (e.g. a.bacci@, k.mcbride@).
+# The LLM associates financial/corporate domains with marketing and wrongly skips these.
+# Matching on address structure is more reliable than asking the model.
+_PERSONAL_INITIAL_RE = re.compile(r"^[a-z]\.[a-z]{2,20}@", re.IGNORECASE)
+
+
+def fetch_emails(config: dict) -> str:
+    """
+    Sequential per-email LLM processing:
+      1. Fetch all email headers (IMAP index phase)
+      2. For each email in recency order (up to _EMAIL_MAX_TO_CHECK):
+           a. Header check LLM call: is this from a real person needing attention? (yes/no)
+           b. If yes: fetch that email's body individually
+           c. Evaluator LLM call: what action is required? (one sentence or 'nothing')
+           d. If actionable: add to summaries; stop once _EMAIL_MAX_TO_KEEP reached
+
+    Each email gets its own focused LLM calls rather than overwhelming a small
+    local model with a large batch. Each body fetch is independently capped at
+    per_email_limit chars (set in email_mcp.get_email_bodies_for).
+
+    Returns a bulleted list of actionable summaries, or empty string if none found.
     """
     try:
-        from email_mcp import get_recent_emails
-        result = get_recent_emails()
-        # Only pass structured content to the LLM; descriptive 'no X' messages
-        # are informative for humans/agents but pollute the summarisation prompt.
-        if "=== Email Index" not in result:
-            print(f"  ({result.strip()})", flush=True)
+        from email_mcp import get_email_index, get_email_bodies_for
+
+        _, email_list = get_email_index()
+        if not email_list:
+            print("  (no emails in last 24h)", flush=True)
             return ""
-        return result
+
+        total = len(email_list)
+        check_up_to = min(total, _EMAIL_MAX_TO_CHECK)
+        print(f"  {total} emails indexed; checking top {check_up_to} sequentially...", flush=True)
+
+        summaries: list[str] = []
+        for i, meta in enumerate(email_list[:check_up_to], 1):
+            if len(summaries) >= _EMAIL_MAX_TO_KEEP:
+                break
+
+            sender = meta.get("from_addr", "")
+            subj_full = meta.get("subject", "")
+            print(f"  [{i}/{check_up_to}] {sender[:30]} | {subj_full[:45]}", flush=True)
+
+            # ── Header check (keyword bypass or LLM) ─────────────────────────
+            is_security = bool(_SECURITY_SENDER_RE.search(sender)) and bool(
+                _SECURITY_SUBJECT_RE.search(subj_full)
+            )
+            is_reminder = bool(_REMINDER_SUBJECT_RE.search(subj_full))
+            is_personal = bool(_PERSONAL_INITIAL_RE.match(sender))
+
+            if is_reminder:
+                # Subject IS the actionable information — no body fetch needed
+                summaries.append(f"Reminder: {subj_full}")
+                print(f"    → kept (reminder): {subj_full[:80]}", flush=True)
+                continue
+
+            if not is_security and not is_personal and not _header_check_llm_call(meta, config):
+                print(f"    → skip", flush=True)
+                continue
+
+            # ── Fetch this email's body individually ──────────────────────────
+            results = get_email_bodies_for(email_list, [i])
+            if not results or not results[0][1]:
+                if is_security:
+                    # Body is HTML-only or unavailable; subject is still worth surfacing
+                    summaries.append(f"Security alert: {subj_full}")
+                    print(f"    → kept (security, no body): {subj_full[:80]}", flush=True)
+                else:
+                    print(f"    → no body", flush=True)
+                continue
+            _, body = results[0]
+
+            # ── Evaluate the body ─────────────────────────────────────────────
+            print(f"    → evaluating body...", flush=True)
+            result = _evaluate_email_llm_call(meta, body, config)
+            cleaned = result.strip()
+            if cleaned.lower() not in ("nothing", "none", ""):
+                summaries.append(cleaned)
+                print(f"    → kept: {cleaned[:80]}", flush=True)
+            else:
+                print(f"    → discarded after body read", flush=True)
+
+        if not summaries:
+            print("  (no actionable emails)", flush=True)
+            return ""
+
+        print(f"  {len(summaries)} actionable email(s) for briefing", flush=True)
+        return "\n".join(f"- {s}" for s in summaries)
+
     except Exception as e:
         print(f"  Warning: email fetch failed: {e}", flush=True)
         return ""
 
 
-def summarise(calendar: str, tasks: str, notes: str, emails: str, config: dict) -> str:
-    """Call Ollama to produce a concise plain-text briefing."""
+def summarise(calendar: str, tasks: str, notes: str, config: dict) -> str:
+    """Call Ollama to produce a concise plain-text briefing. Emails are appended by caller."""
     model = config.get("llm_model", "hermes3")
     ollama_base = config.get("ollama_base", "http://127.0.0.1:11434")
     url = f"{ollama_base}/v1/chat/completions"
@@ -253,12 +505,13 @@ def summarise(calendar: str, tasks: str, notes: str, emails: str, config: dict) 
         "- No section headings, no labels, no headers of any kind\n"
         "- No markdown, no bullet symbols, no preamble, no sign-off\n"
         "- Under 250 words total\n"
-        "Output = up to four blocks separated by one blank line each:\n"
+        "Output = up to three blocks separated by one blank line each:\n"
         "  block 1: calendar — one event per line, format:  HH:MM–HH:MM  Description\n"
         "  block 2: tasks — 3-6 plain lines, each one actionable task from the task index "
                           "(most recent / highest priority first; omit block if no tasks)\n"
-        "  block 3: context — 1-2 sentences of relevant detail from the notes (omit if nothing new)\n"
-        "  block 4: comms — 1 sentence on any email needing a reply (omit if none)"
+        "  block 3: context — at most 1 sentence of factual context directly relevant to today; "
+                          "state only what is explicitly written, do not infer relationships or "
+                          "intentions; omit entirely if nothing is clearly relevant to today"
     )
 
     # No English labels on the data sections — the model echoes them.
@@ -267,8 +520,6 @@ def summarise(calendar: str, tasks: str, notes: str, emails: str, config: dict) 
     if tasks:
         data_parts += [tasks, "---"]
     data_parts.append(notes)
-    if emails:
-        data_parts += ["---", emails]
     data_parts.append("Write the briefing.")
     user_msg = "\n\n".join(data_parts)
 
@@ -342,7 +593,10 @@ def _clean_briefing(text: str) -> str:
     # Drop leading blank lines
     while cleaned and not cleaned[0].strip():
         cleaned.pop(0)
-    return "\n".join(cleaned).strip()
+    text = "\n".join(cleaned).strip()
+    # Collapse 3+ consecutive blank lines to one (LLM sometimes over-separates blocks)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
 
 
 def send_notification(text: str, config: dict) -> None:
@@ -383,11 +637,13 @@ def main():
     print(f"  {len(notes)} chars")
 
     print("Fetching emails...", flush=True)
-    emails = fetch_emails()
+    emails = fetch_emails(config)
     print(f"  {len(emails)} chars")
 
     print("Summarising with LLM...", flush=True)
-    briefing = summarise(calendar, tasks, notes, emails, config)
+    briefing = summarise(calendar, tasks, notes, config)
+    if emails:
+        briefing = briefing.rstrip() + "\n\n" + emails
     print(f"  {len(briefing)} chars, {len(briefing.split())} words")
 
     print()

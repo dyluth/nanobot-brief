@@ -42,7 +42,14 @@ email_accounts:
   # - email: "work@yourcompany.com"
   #   app_password: "xxxx xxxx xxxx xxxx"
 
-# Local LLM backend (Ollama OpenAI-compatible endpoint)
+# ── Email processing (optional overrides) ────────────────────────────────────
+
+# Total character budget for fetched email bodies in Phase 2.
+# Bodies are truncated if the combined text would exceed this.
+# Default: 8000. Increase if you frequently receive long important emails.
+# email_body_budget: 8000
+
+# ── Local LLM backend (Ollama OpenAI-compatible endpoint) ────────────────────
 llm_base_url: http://127.0.0.1:11434/v1
 llm_model: llama3.1:8b
 # Model notes:

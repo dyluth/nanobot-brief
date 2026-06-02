@@ -11,15 +11,16 @@ from email.header import decode_header as _hdr_decode
 from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 
+import os
+
 import yaml
 from mcp.server.fastmcp import FastMCP
 
 CONFIG_PATH = Path("/home/cam/nanobot-brief/config.yaml")
-LOG_FILE    = Path("/home/cam/daily-briefings/mcp-debug.log")
 IMAP_HOST    = "imap.gmail.com"
 IMAP_PORT    = 993
 IMAP_TIMEOUT = 30   # seconds; guards against hung TCP connections
-HARD_LIMIT   = 3000
+HARD_LIMIT   = 3000  # kept for backward-compat get_recent_emails() wrapper
 
 # Locale-safe English month abbreviations for IMAP SINCE date format
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -27,17 +28,19 @@ _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 
 def _setup_logger(name: str) -> logging.Logger:
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    log_file = Path(
+        os.environ.get("BRIEFING_LOG_FILE", "/home/cam/daily-briefings/mcp-debug.log")
+    )
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     log = logging.getLogger(name)
     log.setLevel(logging.DEBUG)
     if not log.handlers:
         fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-        fh = logging.FileHandler(LOG_FILE)
+        fh = logging.FileHandler(log_file)
         fh.setFormatter(fmt)
         log.addHandler(fh)
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
+        # No stderr handler — avoids duplicate lines in the cron/briefing log
+        # (FastMCP already writes INFO+ to stderr via its own Rich logger)
     return log
 
 
@@ -202,6 +205,209 @@ def _get_plain_body(mail: imaplib.IMAP4_SSL, uid: str) -> str:
     return body
 
 
+def _normalise_app_password(pw: str) -> str:
+    """Remove all whitespace variants (including Unicode non-breaking spaces)."""
+    return re.sub(r"[\s ​    　]+", "", pw)
+
+
+def _close_all(connections: dict) -> None:
+    """Best-effort logout of all open IMAP connections."""
+    for mail in connections.values():
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+
+# ── Public helpers (called directly by briefing.py) ──────────────────────────
+
+def get_email_index() -> tuple[str, list[dict]]:
+    """
+    Phase 1: fetch lightweight metadata for all recent emails across all accounts.
+
+    Opens IMAP connections, batch-fetches headers from the last 24 hours, then
+    closes connections. Returns a (formatted_index_str, email_metadata_list) tuple.
+
+    formatted_index_str — the "=== Email Index (last 24h) ===" section, ready
+    to pass to a selector LLM call.
+
+    email_metadata_list — sorted most-recent-first list of dicts:
+      {uid, account, from_addr, subject, dt}
+    Pass this list (plus your chosen 1-based indices) to get_email_bodies_for().
+
+    Returns ("", []) when no accounts are configured or no recent mail was found.
+    """
+    log.info("get_email_index called")
+    config = _load_config()
+    accounts = config.get("email_accounts", [])
+
+    if not accounts:
+        log.warning("no email_accounts configured in config.yaml")
+        return ("", [])
+
+    cutoff = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(hours=24)
+    all_emails: list[dict] = []
+
+    for acct in accounts:
+        email_addr = (acct.get("email") or "").strip()
+        app_password = (acct.get("app_password") or "").strip()
+        if not email_addr or not app_password:
+            log.warning("skipping incomplete email account entry (missing email or app_password)")
+            continue
+
+        app_password = _normalise_app_password(app_password)
+        log.info("connecting to IMAP for %s (index phase)", email_addr)
+        try:
+            mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
+            mail.login(email_addr, app_password)
+            status, _ = mail.select("inbox", readonly=True)
+            if status != "OK":
+                log.error("inbox SELECT failed for %s — skipping", email_addr)
+                mail.logout()
+                continue
+            index = _fetch_account_index(mail, email_addr, cutoff)
+            all_emails.extend(index)
+            mail.logout()
+        except Exception as exc:
+            log.error("index phase failed for %s: %s", email_addr, exc)
+
+    if not all_emails:
+        log.info("no emails found across all accounts in the last 24h")
+        return ("", [])
+
+    # Sort by account order in config first (business accounts listed first get priority),
+    # then by recency within each account. Prevents a newsletter-heavy inbox from
+    # pushing business emails past the per-run check cap.
+    acct_order = {(a.get("email") or "").strip(): i for i, a in enumerate(accounts)}
+    all_emails.sort(key=lambda e: (acct_order.get(e["account"], 99), -e["dt"].timestamp()))
+    multi = len({e["account"] for e in all_emails}) > 1
+    log.info("total emails indexed: %d (multi-account: %s)", len(all_emails), multi)
+
+    index_lines = ["=== Email Index (last 24h) ==="]
+    for i, em in enumerate(all_emails, 1):
+        local_time = em["dt"].astimezone().strftime("%H:%M")
+        from_s = em["from_addr"][:45]
+        subj_s = em["subject"][:55]
+        acct_tag = f"  [{em['account']}]" if multi else ""
+        index_lines.append(f"[{i}] {local_time} | {from_s} | {subj_s}{acct_tag}")
+
+    index_str = "\n".join(index_lines)
+    return (index_str, all_emails)
+
+
+def get_email_bodies_for(
+    email_list: list[dict],
+    indices: list[int],
+    budget: int = 15000,
+    per_email_limit: int = 3000,
+) -> list[tuple[dict, str]]:
+    """
+    Phase 2: fetch bodies for specific 1-based indices from email_list.
+
+    Reopens IMAP connections only for the accounts needed (lightweight reconnect —
+    fine for a cron script). Fetches full RFC822 messages, extracts text/plain only.
+
+    indices         — 1-based indices into email_list (as shown in the Email Index).
+    budget          — total character cap across all fetched bodies (default 15000).
+    per_email_limit — hard cap per individual email body (default 3000).
+                      Prevents one large email from consuming the entire budget and
+                      starving all other selected emails. Applied before the total budget
+                      check so every email gets a fair share.
+
+    Returns a list of (metadata_dict, body_str) tuples in the order of `indices`.
+    body_str is "" if the email has no text content, the fetch failed, or the
+    connection was unavailable.
+
+    Out-of-range indices are silently skipped.
+    """
+    if not indices or not email_list:
+        return []
+
+    config = _load_config()
+    accounts_map = {
+        (acct.get("email") or "").strip(): acct
+        for acct in config.get("email_accounts", [])
+    }
+
+    # Determine which accounts need connections
+    needed_accounts: set[str] = set()
+    for idx in indices:
+        if 1 <= idx <= len(email_list):
+            needed_accounts.add(email_list[idx - 1]["account"])
+
+    # Open connections for needed accounts only
+    connections: dict[str, imaplib.IMAP4_SSL] = {}
+    for email_addr in needed_accounts:
+        acct = accounts_map.get(email_addr)
+        if not acct:
+            log.warning("no config entry for account %s", email_addr)
+            continue
+        app_password = _normalise_app_password((acct.get("app_password") or "").strip())
+        if not app_password:
+            log.warning("no app_password for %s", email_addr)
+            continue
+        log.info("connecting to IMAP for %s (body phase)", email_addr)
+        try:
+            mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
+            mail.login(email_addr, app_password)
+            status, _ = mail.select("inbox", readonly=True)
+            if status != "OK":
+                log.error("inbox SELECT failed for %s", email_addr)
+                mail.logout()
+                continue
+            connections[email_addr] = mail
+        except Exception as exc:
+            log.error("body-phase connection failed for %s: %s", email_addr, exc)
+
+    results: list[tuple[dict, str]] = []
+    remaining = budget
+
+    for idx in indices:
+        if not (1 <= idx <= len(email_list)):
+            log.warning("index %d out of range (list has %d)", idx, len(email_list))
+            continue
+
+        em = email_list[idx - 1]
+        conn = connections.get(em["account"])
+        if conn is None:
+            log.warning("no connection for %s, skipping [%d]", em["account"], idx)
+            results.append((em, ""))
+            continue
+
+        if remaining <= 0:
+            log.debug("budget exhausted; skipping [%d]", idx)
+            results.append((em, ""))
+            continue
+
+        log.debug("fetching body for [%d] uid=%s account=%s", idx, em["uid"], em["account"])
+        try:
+            body = _get_plain_body(conn, em["uid"])
+        except Exception as exc:
+            log.error("body fetch error for [%d]: %s", idx, exc)
+            body = ""
+
+        # Per-email cap: clamp each body independently before touching total budget
+        if body and len(body) > per_email_limit:
+            ellipsis = "... [truncated]"
+            body = body[: per_email_limit - len(ellipsis)] + ellipsis
+
+        # Total budget check: stop adding bodies once the aggregate limit is reached
+        if body and len(body) > remaining:
+            ellipsis = "... [truncated]"
+            body = body[: remaining - len(ellipsis)] + ellipsis
+
+        if body:
+            remaining -= len(body)
+
+        results.append((em, body))
+
+    _close_all(connections)
+    log.info("body phase complete: %d/%d emails fetched", len(results), len(indices))
+    return results
+
+
+# ── MCP tool (backward-compatible) ───────────────────────────────────────────
+
 log.info("email MCP server started")
 mcp = FastMCP("email")
 
@@ -215,137 +421,46 @@ def get_recent_emails() -> str:
       Phase 1 — Index: fetch sender/subject/time for ALL recent emails across
                 all accounts (lightweight header-only fetch, single round-trip
                 per account).
-      Phase 2 — Expand: fetch text/plain bodies in recency order, filling a
-                hard 3000-character budget. Most recent emails get full bodies;
-                older ones are truncated or marked as budget-reached.
+      Phase 2 — Expand: fetch text/plain bodies for the top 3 most recent emails
+                within a hard 3000-character budget.
 
     Returns a formatted string (index + bodies) or a descriptive message if
     no accounts are configured or no recent mail was found.
+
+    For smarter LLM-driven selection, call get_email_index() and
+    get_email_bodies_for() directly from briefing.py instead.
     """
-    log.info("get_recent_emails called")
-    config = _load_config()
-    accounts = config.get("email_accounts", [])
+    log.info("get_recent_emails called (backward-compat wrapper)")
+    index_str, email_list = get_email_index()
 
-    if not accounts:
-        log.warning("no email_accounts configured in config.yaml")
-        return "No email accounts configured."
-
-    cutoff = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(hours=24)
-    all_emails: list[dict] = []
-    # Keep connections open for Phase 2 body fetches; keyed by account email string
-    connections: dict[str, imaplib.IMAP4_SSL] = {}
-
-    # ── Phase 1: index all accounts ──────────────────────────────────────────
-    for acct in accounts:
-        email_addr = (acct.get("email") or "").strip()
-        app_password = (acct.get("app_password") or "").strip()
-        if not email_addr or not app_password:
-            log.warning("skipping incomplete email account entry (missing email or app_password)")
-            continue
-
-        # Normalize app password: remove ALL whitespace including Unicode non-breaking
-        # spaces (\xa0) that are introduced when copy-pasting from web pages.
-        # Gmail App Passwords are exactly 16 letters; spaces are cosmetic only.
-        app_password = re.sub(r"[\s\u00a0\u200b\u202f\u2009\u2002\u2003\u3000]+", "", app_password)
-
-        log.info("connecting to IMAP for %s", email_addr)
-        try:
-            mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
-            mail.login(email_addr, app_password)
-            status, _ = mail.select("inbox", readonly=True)
-            if status != "OK":
-                log.error("inbox SELECT failed for %s — skipping", email_addr)
-                mail.logout()
-                continue
-            connections[email_addr] = mail
-            index = _fetch_account_index(mail, email_addr, cutoff)
-            all_emails.extend(index)
-        except Exception as exc:
-            log.error("connection/index failed for %s: %s", email_addr, exc)
-
-    if not all_emails:
-        _close_all(connections)
-        log.info("no emails found across all accounts in the last 24h")
+    if not email_list:
         return "No emails in the last 24 hours."
 
-    # Sort globally by most recent first
-    all_emails.sort(key=lambda e: e["dt"], reverse=True)
-    multi = len(connections) > 1
-    log.info("total emails across all accounts: %d (multi-account: %s)", len(all_emails), multi)
+    # Default: expand top 3 by recency
+    default_indices = list(range(1, min(4, len(email_list) + 1)))
+    body_results = get_email_bodies_for(email_list, default_indices, budget=HARD_LIMIT)
 
-    # ── Build index section ───────────────────────────────────────────────────
-    index_lines = ["=== Email Index (last 24h) ==="]
-    for i, em in enumerate(all_emails, 1):
-        local_time = em["dt"].astimezone().strftime("%H:%M")
-        from_s = em["from_addr"][:45]
-        subj_s = em["subject"][:55]
-        acct_tag = f"  [{em['account']}]" if multi else ""
-        index_lines.append(f"[{i}] {local_time} | {from_s} | {subj_s}{acct_tag}")
-    index_section = "\n".join(index_lines)
+    if not body_results:
+        return index_str
 
-    # ── Phase 2: budget-aware body expansion ──────────────────────────────────
     bodies_header = "\n\n=== Bodies ===\n"
-    budget = HARD_LIMIT - len(index_section) - len(bodies_header)
-
     body_chunks: list[str] = []
-
-    for i, em in enumerate(all_emails, 1):
+    for orig_idx, (em, body) in zip(default_indices, body_results):
         subj_s = em["subject"][:55]
-        section_header = f"--- [{i}] {subj_s} ---\n"
-
-        if budget <= len(section_header):
-            # No space left even for the section header — stop
-            log.debug("budget exhausted at email [%d]", i)
-            break
-
-        mail_conn = connections.get(em["account"])
-        if mail_conn is None:
-            chunk = section_header + "[connection unavailable]\n"
-            body_chunks.append(chunk)
-            budget -= len(chunk)
-            continue
-
-        log.debug("fetching body for [%d] uid=%s account=%s", i, em["uid"], em["account"])
-        try:
-            body = _get_plain_body(mail_conn, em["uid"])
-        except Exception as exc:
-            log.error("body fetch error for [%d]: %s", i, exc)
-            body = ""
-
+        section_header = f"--- [{orig_idx}] {subj_s} ---\n"
         if not body:
-            chunk = section_header + "[no text content]\n"
+            body_chunks.append(section_header + "[no text content]\n")
         else:
-            avail = budget - len(section_header) - 1  # 1 for trailing newline
-            if avail <= 0:
-                chunk = section_header + "[budget reached]\n"
-            elif len(body) <= avail:
-                chunk = section_header + body + "\n"
-            else:
-                ellipsis = "... [truncated]\n"
-                chunk = section_header + body[: avail - len(ellipsis)] + ellipsis
+            body_chunks.append(section_header + body + "\n")
 
-        body_chunks.append(chunk)
-        budget -= len(chunk)
+    result = index_str + bodies_header + "\n".join(body_chunks)
 
-    _close_all(connections)
-
-    result = index_section + bodies_header + "\n".join(body_chunks)
-
-    # Final safety clamp (should not be needed, but belt-and-suspenders)
+    # Final safety clamp (belt-and-suspenders)
     if len(result) > HARD_LIMIT:
         result = result[: HARD_LIMIT - 22] + "\n[hard limit reached]"
 
     log.info("returning %d chars of email content", len(result))
     return result
-
-
-def _close_all(connections: dict) -> None:
-    """Best-effort logout of all open IMAP connections."""
-    for mail in connections.values():
-        try:
-            mail.logout()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

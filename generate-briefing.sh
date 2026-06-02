@@ -3,10 +3,18 @@
 # but we still want the script to continue and attempt the send.
 set -uo pipefail
 
-LOG=/home/cam/daily-briefings/cron.log
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR=/home/cam/daily-briefings
 
-echo "" >> "$LOG"
+# Per-run timestamped log files — one pair per execution, never appended across runs
+RUN_TS=$(date '+%Y-%m-%d-%H%M%S')
+LOG="${LOG_DIR}/briefing-${RUN_TS}.log"
+export BRIEFING_LOG_FILE="${LOG_DIR}/mcp-debug-${RUN_TS}.log"
+
+# Keep logs from the last 14 days; silently ignore errors if dir is empty
+find "$LOG_DIR" -name "briefing-*.log"   -mtime +14 -delete 2>/dev/null || true
+find "$LOG_DIR" -name "mcp-debug-*.log" -mtime +14 -delete 2>/dev/null || true
+
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG"
 
 # Pull latest Logseq notes

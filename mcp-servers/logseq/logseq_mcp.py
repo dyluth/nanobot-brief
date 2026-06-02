@@ -11,21 +11,22 @@ import yaml
 from mcp.server.fastmcp import FastMCP
 
 CONFIG_PATH = Path("/home/cam/nanobot-brief/config.yaml")
-LOG_FILE = Path("/home/cam/daily-briefings/mcp-debug.log")
 
 
 def _setup_logger(name: str) -> logging.Logger:
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    import os
+    log_file = Path(
+        os.environ.get("BRIEFING_LOG_FILE", "/home/cam/daily-briefings/mcp-debug.log")
+    )
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     log = logging.getLogger(name)
     log.setLevel(logging.DEBUG)
     if not log.handlers:
         fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-        fh = logging.FileHandler(LOG_FILE)
+        fh = logging.FileHandler(log_file)
         fh.setFormatter(fmt)
         log.addHandler(fh)
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
+        # No stderr handler — avoids duplicate lines in the cron/briefing log
     return log
 
 
