@@ -13,7 +13,7 @@ import yaml
 from icalendar import Calendar
 from mcp.server.fastmcp import FastMCP
 
-CONFIG_PATH = Path("/home/cam/nanobot-brief/config.yaml")
+CONFIG_PATH = Path("/home/cam/local_agents/nanobot-brief/config.yaml")
 
 
 def _setup_logger(name: str) -> logging.Logger:

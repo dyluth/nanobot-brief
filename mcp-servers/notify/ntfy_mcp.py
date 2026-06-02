@@ -13,7 +13,7 @@ import requests
 import yaml
 from mcp.server.fastmcp import FastMCP
 
-CONFIG_PATH = Path("/home/cam/nanobot-brief/config.yaml")
+CONFIG_PATH = Path("/home/cam/local_agents/nanobot-brief/config.yaml")
 LOG_FILE = Path("/home/cam/daily-briefings/mcp-debug.log")
 
 

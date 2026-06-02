@@ -16,7 +16,7 @@ import os
 import yaml
 from mcp.server.fastmcp import FastMCP
 
-CONFIG_PATH = Path("/home/cam/nanobot-brief/config.yaml")
+CONFIG_PATH = Path("/home/cam/local_agents/nanobot-brief/config.yaml")
 IMAP_HOST    = "imap.gmail.com"
 IMAP_PORT    = 993
 IMAP_TIMEOUT = 30   # seconds; guards against hung TCP connections
